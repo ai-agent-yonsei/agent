@@ -37,12 +37,27 @@ PUBLIC_URL = cfg("PUBLIC_URL", "")
 DATA_PATH = cfg("DATA_PATH", "/tmp/agent_mafia_state.json")
 
 
-@st.cache_resource
-def get_game():
-    return Game(AI(API_KEY, MODEL, PROVIDER), data_path=DATA_PATH)
+def _version():
+    """engine.py 내용과 AI 설정이 바뀌면 값이 달라진다.
+    코드가 업데이트되면 새 게임 객체를 만들되, 저장 파일에서 진행 상태를 다시 읽어 와 이어 간다."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine.py"), "rb") as f:
+        h.update(f.read())
+    h.update(f"{PROVIDER}|{MODEL}|{API_KEY}".encode())
+    return h.hexdigest()[:16]
 
 
-game = get_game()
+@st.cache_resource(max_entries=1)
+def get_game(version):
+    import importlib
+
+    import engine
+    engine = importlib.reload(engine)  # 업데이트된 engine.py를 확실히 다시 읽는다
+    return engine.Game(engine.AI(API_KEY, MODEL, PROVIDER), data_path=DATA_PATH)
+
+
+game = get_game(_version())
 esc = html.escape
 
 # ------------------------------------------------------------------ style
