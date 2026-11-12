@@ -21,16 +21,24 @@
 4. **Advanced settings** 를 열어요.
    - Python version: 3.12
    - Secrets 칸에 아래를 붙여 넣고 값을 바꿔요.
+     Anthropic(Claude)을 쓸 때:
      ```toml
      ANTHROPIC_API_KEY = "sk-ant-..."
      HOST_PASSWORD = "진행자-비밀번호"
-     MODEL = "claude-haiku-5-5"
      PUBLIC_URL = "https://agent-mafia-yonsei.streamlit.app"
      ```
+     OpenAI를 쓸 때:
+     ```toml
+     OPENAI_API_KEY = "sk-..."
+     HOST_PASSWORD = "진행자-비밀번호"
+     PUBLIC_URL = "https://agent-mafia-yonsei.streamlit.app"
+     ```
+     넣은 키에 따라 자동으로 골라요. 둘 다 넣으면 Anthropic을 쓰고, `PROVIDER = "openai"`를 추가하면 OpenAI로 바뀌어요.
+     모델을 바꾸려면 `MODEL = "gpt-4o-mini"`처럼 적어요. 기본값은 Anthropic `claude-haiku-5-5`, OpenAI `gpt-5-mini`예요.
 5. **Deploy** 를 누르면 1~3분 뒤에 앱이 열려요.
 
 API 키가 없으면 **데모 모드**로 돌아가요. AI 대신 무작위 응답으로 진행되니 리허설용으로 쓰세요.
-API 키는 https://console.anthropic.com 에서 만들 수 있어요.
+API 키는 Anthropic은 https://console.anthropic.com , OpenAI는 https://platform.openai.com/api-keys 에서 만들 수 있어요.
 
 ## 수업 진행 순서
 
@@ -49,7 +57,7 @@ API 키는 https://console.anthropic.com 에서 만들 수 있어요.
 - 게임 상태는 서버 메모리와 임시 파일에 저장돼요. 무료 Streamlit 앱은 한동안 접속이 없으면 잠들고,
   깨어나면 상태가 초기화될 수 있어요. 수업 직전에 한 번 접속해서 깨워 두세요.
 - 앱 하나에서 게임 하나가 돌아가요. 두 반을 동시에 하려면 앱을 두 개 배포하세요.
-- AI 호출은 14명, 5라운드 기준 한 판에 약 300회예요. Anthropic 콘솔에서 월 사용 한도를 정해 두면 안심이에요.
+- AI 호출은 14명, 5라운드 기준 한 판에 약 300회예요. 쓰는 회사의 콘솔에서 월 사용 한도를 정해 두면 안심이에요.
 - 진행자 화면은 새로고침하면 비밀번호를 다시 넣어야 해요.
 
 ## 로컬에서 실행

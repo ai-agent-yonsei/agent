@@ -86,10 +86,16 @@ def new_game_fields(settings):
 
 
 # ---------------------------------------------------------------- AI
+DEFAULT_MODELS = {"anthropic": "claude-haiku-5-5", "openai": "gpt-5-mini"}
+
+
 class AI:
-    def __init__(self, api_key=None, model="claude-haiku-5-5"):
+    """provider: "anthropic" 또는 "openai". 키가 없으면 데모 모드."""
+
+    def __init__(self, api_key=None, model=None, provider="anthropic"):
+        self.provider = provider if provider in DEFAULT_MODELS else "anthropic"
         self.api_key = api_key
-        self.model = model
+        self.model = model or DEFAULT_MODELS[self.provider]
         self._client = None
         self.last_error = ""
 
@@ -97,20 +103,40 @@ class AI:
     def demo(self):
         return not self.api_key
 
-    def ask(self, prompt):
-        if self.demo:
-            return None
+    @property
+    def label(self):
+        return ("OpenAI " if self.provider == "openai" else "Anthropic ") + self.model
+
+    def _call(self, prompt):
+        if self.provider == "openai":
+            if self._client is None:
+                import openai
+                self._client = openai.OpenAI(api_key=self.api_key, max_retries=2, timeout=60)
+            kw = {}
+            reasoning = self.model.startswith(("gpt-5", "o1", "o3", "o4"))
+            if reasoning:  # 추론 모델은 생각을 최소로 해야 빠르고, 토큰 한도를 넉넉히 줘야 답이 잘리지 않아요
+                kw = {"reasoning_effort": "minimal" if self.model.startswith("gpt-5") else "low",
+                      "max_completion_tokens": 2000}
+            else:
+                kw = {"max_tokens": 400}
+            r = self._client.chat.completions.create(
+                model=self.model, messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}, **kw)
+            return r.choices[0].message.content or ""
         if self._client is None:
             import anthropic
             self._client = anthropic.Anthropic(api_key=self.api_key, max_retries=2, timeout=60)
+        r = self._client.messages.create(
+            model=self.model, max_tokens=400, messages=[{"role": "user", "content": prompt}])
+        return "".join(getattr(b, "text", "") for b in r.content)
+
+    def ask(self, prompt):
+        if self.demo:
+            return None
         err = None
         for attempt in range(3):
             try:
-                r = self._client.messages.create(
-                    model=self.model, max_tokens=400,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                text = "".join(getattr(b, "text", "") for b in r.content)
+                text = self._call(prompt)
                 self.last_error = ""
                 return parse_json(text)
             except Exception as e:  # noqa: BLE001

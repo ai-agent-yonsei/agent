@@ -26,8 +26,12 @@ def cfg(name, default=None):
     return os.environ.get(name, default)
 
 
-API_KEY = cfg("ANTHROPIC_API_KEY")
-MODEL = cfg("MODEL", "claude-haiku-5-5")
+ANTHROPIC_KEY = cfg("ANTHROPIC_API_KEY")
+OPENAI_KEY = cfg("OPENAI_API_KEY")
+# PROVIDER를 따로 정하지 않으면 넣어 둔 키를 보고 고른다 (둘 다 있으면 Anthropic)
+PROVIDER = (cfg("PROVIDER") or ("anthropic" if ANTHROPIC_KEY else "openai" if OPENAI_KEY else "anthropic")).lower()
+API_KEY = OPENAI_KEY if PROVIDER == "openai" else ANTHROPIC_KEY
+MODEL = cfg("MODEL")
 HOST_PASSWORD = cfg("HOST_PASSWORD")
 PUBLIC_URL = cfg("PUBLIC_URL", "")
 DATA_PATH = cfg("DATA_PATH", "/tmp/agent_mafia_state.json")
@@ -35,7 +39,7 @@ DATA_PATH = cfg("DATA_PATH", "/tmp/agent_mafia_state.json")
 
 @st.cache_resource
 def get_game():
-    return Game(AI(API_KEY, MODEL), data_path=DATA_PATH)
+    return Game(AI(API_KEY, MODEL, PROVIDER), data_path=DATA_PATH)
 
 
 game = get_game()
@@ -449,9 +453,9 @@ def host_controls():
     s, running = game.snapshot()
     phase_bar(s, running)
     if game.ai.demo:
-        st.info("**데모 모드**: AI API 키가 없어 무작위 응답으로 진행해요. 리허설용이에요. 실제 수업 전에 Secrets에 ANTHROPIC_API_KEY를 넣어 주세요.")
+        st.info("**데모 모드**: AI API 키가 없어 무작위 응답으로 진행해요. 리허설용이에요. 실제 수업 전에 Secrets에 ANTHROPIC_API_KEY 또는 OPENAI_API_KEY를 넣어 주세요.")
     else:
-        st.caption(f"AI 모델: {MODEL}")
+        st.caption(f"AI 모델: {game.ai.label}")
     if s.get("error"):
         st.error(s["error"])
     st_ = s["status"]
