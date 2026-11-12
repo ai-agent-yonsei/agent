@@ -12,7 +12,7 @@ import time
 
 import streamlit as st
 
-from engine import AI, DEFAULT_SETTINGS, EDITABLE_PHASES, Game, PHASE_KO, ROLE_KO, alive, label, seat_by_id
+from engine import AI, EDITABLE_PHASES, Game, ROLE_KO, alive, label, phase_name, seat_by_id
 
 st.set_page_config(page_title="에이전트 마피아", page_icon="🕵️", layout="wide", initial_sidebar_state="collapsed")
 
@@ -93,6 +93,11 @@ table.am-lb .r{text-align:right;font-family:"IBM Plex Mono",monospace}
 .am-code{font-family:"IBM Plex Mono",monospace;font-size:1.6em;font-weight:600;letter-spacing:.15em;color:var(--ink)}
 .am-card{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:var(--sunk);color:var(--ink);height:100%}
 .am-card pre{white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:.88em;margin:6px 0 0}
+.am-steps{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 10px}
+.am-step{padding:4px 12px;border-radius:999px;border:1px solid var(--line);color:var(--muted);font-weight:600;font-size:.9em;background:#fff}
+.am-step.now{background:var(--night);border-color:var(--night);color:#fff}
+.am-step.done{color:var(--ink);background:var(--sunk)}
+.am-arrow{color:var(--muted)}
 body.am-big .am-msg,body.am-big table.am-lb{font-size:1.25em}
 </style>
 """, unsafe_allow_html=True)
@@ -101,7 +106,7 @@ body.am-big .am-msg,body.am-big table.am-lb{font-size:1.25em}
 # ------------------------------------------------------------------ shared bits
 def phase_bar(s, running):
     st_ = s["status"]
-    pill = (f'{s["round"]}라운드 · ' if s["round"] else "") + PHASE_KO.get(st_, st_)
+    pill = (f'{s["round"]}라운드 · ' if s["round"] else "") + phase_name(s)
     timer = ""
     if s.get("deadline") and st_ in ("writing", "strategy"):
         left = max(0, int(s["deadline"] - time.time()))
@@ -289,7 +294,7 @@ def me_status(pid):
     st.markdown(f'{lock} &nbsp; <span style="color:var(--muted)">{esc(help_)} · {"v" + str(vcount) + " 제출됨" if vcount else "아직 제출 전"}</span>',
                 unsafe_allow_html=True)
 
-    if s["status"] == "day" and s["round"]:
+    if s["status"] == "day" and s["round"] and s.get("step") in ("talking", "await_vote"):
         with st.container(border=True):
             st.markdown("**예측 베팅** · 이번 라운드 투표로 누가 탈락할지 맞히면 +1")
             opts = [x["seat"] for x in alive(s)]
@@ -458,20 +463,30 @@ def host_controls():
         st.caption(f"AI 모델: {game.ai.label}")
     if s.get("error"):
         st.error(s["error"])
-    st_ = s["status"]
-    interrupted = not running and st_ in ("day", "vote", "night")
-    round_label = (f'{s["round"]}라운드 다시 진행' if interrupted else "1라운드 시작" if st_ == "writing"
-                   else f'{s["round"] + 1}라운드 시작' if st_ == "strategy" else "라운드 시작")
-    b = st.columns(4)
-    if b[0].button("역할 배정", type="primary", disabled=running or st_ != "lobby", width="stretch"):
+    st_, step = s["status"], s.get("step")
+    # 라운드 진행 표시: 낮 토론 → 투표 → 밤 → 작전 타임
+    stages = [("day", "낮 토론"), ("vote", "투표"), ("night", "밤"), ("strategy", "작전 타임")]
+    cur = [k for k, _ in stages].index(st_) if st_ in [k for k, _ in stages] else -1
+    chips = "".join(
+        f'<span class="am-step {"now" if i == cur else "done" if i < cur else ""}">{name}</span>' + ('<span class="am-arrow">→</span>' if i < 3 else "")
+        for i, (_, name) in enumerate(stages))
+    st.markdown(f'<div class="am-steps">{chips}</div>', unsafe_allow_html=True)
+
+    action = game.next_action()
+    b = st.columns([1, 1.6, 1.2, 1, 1.2])
+    if b[0].button("역할 배정", disabled=running or st_ != "lobby", width="stretch"):
         st.toast(game.assign_roles() or "역할을 배정했어요")
-    if b[1].button(round_label, type="primary", disabled=running or not (st_ in ("writing", "strategy") or interrupted),
-                   width="stretch"):
-        st.toast(game.start_round() or "라운드를 시작했어요")
-    if b[2].button("시상 집계", disabled=st_ != "ended", width="stretch"):
+    if action:
+        if b[1].button(action[1], type="primary", width="stretch", key=f"act_{action[0]}"):
+            st.toast(game.do_action(action[0]) or f"{action[1]}: 시작했어요")
+    else:
+        b[1].button("AI 진행 중…" if running else "다음 단계 없음", disabled=True, width="stretch", key="act_none")
+    if b[2].button("한 바퀴 더 토론", disabled=running or not (st_ == "day" and step == "await_vote"), width="stretch"):
+        st.toast(game.more_talk() or "토론을 한 바퀴 더 진행해요")
+    if b[3].button("시상 집계", disabled=st_ != "ended", width="stretch"):
         game.tally_awards()
         st.toast("시상 결과를 중계 화면에 공개했어요")
-    with b[3].popover("게임 종료 / 초기화", width="stretch"):
+    with b[4].popover("게임 종료 / 초기화", width="stretch"):
         if st.button("지금 게임 종료 (마피아 승리 처리)", disabled=running or st_ in ("lobby", "ended")):
             st.toast(game.end_now() or "게임을 종료했어요")
         if st.button("새 게임으로 초기화 (명단·프롬프트 유지)", disabled=running):

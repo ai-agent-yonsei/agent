@@ -20,6 +20,12 @@ PHASE_KO = {
 }
 DEFAULT_SETTINGS = {"mafia": 2, "max_rounds": 5, "passes": 2, "strategy_sec": 60, "reflect": True}
 EDITABLE_PHASES = ("lobby", "writing", "strategy")
+STEP_KO = {"talking": "낮 토론", "await_vote": "투표 대기", "voting": "투표 중",
+           "await_night": "밤 대기", "night": "밤", "reflecting": "작전 타임"}
+
+
+def phase_name(s):
+    return STEP_KO.get(s.get("step")) or PHASE_KO.get(s["status"], s["status"])
 
 BOT_NAMES = ["하늘", "바다", "노을", "별빛", "새벽", "들꽃", "구름", "솔바람", "단풍", "은하",
              "파도", "이슬", "보름", "산들", "여울", "가람"]
@@ -47,6 +53,12 @@ def seat_by_no(s, n):
 
 def alive(s):
     return [x for x in s["seats"] if x["alive"]]
+
+
+def was(role):
+    """시민 -> 시민이었어요, 마피아 -> 마피아였어요"""
+    w = ROLE_KO[role]
+    return w + ("이었어요" if (ord(w[-1]) - 0xAC00) % 28 else "였어요")
 
 
 def label(x):
@@ -81,7 +93,7 @@ def new_game_fields(settings):
         "roles": {}, "scores": {}, "feedback": {}, "memos": {}, "reasons": [], "mafia_chat": [],
         "log": [], "bets": {}, "awards": {}, "award_result": None, "busy": "", "speaking": None,
         "last_event": "참가자를 기다리고 있어요.", "deadline": None, "winner": None, "error": "",
-        "snap": {}, "reveal": None, "settings": settings,
+        "snap": {}, "reveal": None, "settings": settings, "step": "", "pending": {},
     }
 
 
@@ -304,8 +316,8 @@ class Game:
 
     def bet(self, pid, seat_no):
         with self.lock:
-            if self.s["status"] != "day":
-                return "베팅은 낮 토론 중에만 할 수 있어요."
+            if self.s["status"] != "day" or self.s.get("step") not in ("talking", "await_vote"):
+                return "베팅은 투표가 시작되기 전까지만 할 수 있어요."
             self.s["bets"][pid] = {"round": self.s["round"], "seat": int(seat_no)}
             self.save()
 
@@ -342,30 +354,73 @@ class Game:
             for k in ("feedback", "memos", "bets", "awards", "snap"):
                 self.s[k] = {}
             self.s["reasons"], self.s["mafia_chat"], self.s["log"] = [], [], []
-            self.s.update(status="writing", round=0, winner=None, reveal=None, award_result=None, error="",
+            self.s.update(status="writing", step="", pending={}, round=0, winner=None, reveal=None, award_result=None, error="",
                           deadline=time.time() + 600,
                           last_event="역할이 배정됐어요. 내 에이전트 화면에서 역할을 확인하고 전략 프롬프트를 쓰세요.")
             self.save()
         self._log("sys", f"플레이어 {len(ids)}명, 마피아 {m}명. 좌석과 역할이 배정됐어요.")
 
-    def start_round(self):
+    # 진행자가 버튼으로 한 단계씩 진행한다:
+    #   라운드 시작(낮 토론) -> [한 바퀴 더 토론] -> 투표 실시 -> 밤 시작 -> 작전 타임
+    def next_action(self):
+        """진행자 화면에 보여 줄 다음 버튼 (키, 이름). 진행 중이거나 할 일이 없으면 None."""
+        if self.running:
+            return None
+        st, step, r = self.s["status"], self.s.get("step"), self.s["round"]
+        if st == "writing":
+            return "round", "1라운드 시작 (낮 토론)"
+        if st == "strategy":
+            return "round", f"{r + 1}라운드 시작 (낮 토론)"
+        if st == "day":  # 토론이 끝났거나, 서버 재시작으로 토론이 끊긴 경우
+            return "vote", "투표 실시"
+        if st == "vote" and step == "voting":
+            return "vote", "투표 다시 실시"
+        if st == "vote":
+            return "night", "밤 시작 (마피아 행동)"
+        if st == "night":
+            return "night", "밤 다시 진행"
+        return None
+
+    def _spawn(self, fn, *args):
         with self.lock:
             if self.running:
-                return "이미 진행 중이에요."
-            st = self.s["status"]
-            if st in ("day", "vote", "night"):  # 서버 재시작 등으로 끊긴 라운드를 다시 진행
-                self.s["round"] = max(0, self.s["round"] - 1)
-                self.s["log"] = [e for e in self.s["log"] if e["round"] <= self.s["round"]]
-            elif st not in ("writing", "strategy"):
-                return "지금은 라운드를 시작할 수 없어요."
+                return "이미 진행 중이에요. 잠시 기다려 주세요."
             self.running = True
-        threading.Thread(target=self._run_round_safe, daemon=True).start()
+        threading.Thread(target=self._safe, args=(fn, *args), daemon=True).start()
+
+    def start_round(self):
+        with self.lock:
+            if self.s["status"] not in ("writing", "strategy"):
+                return "지금은 라운드를 시작할 수 없어요."
+        return self._spawn(self._stage_day_start)
+
+    def more_talk(self):
+        with self.lock:
+            if self.s["status"] != "day" or self.s.get("step") != "await_vote":
+                return "토론이 끝난 뒤에만 한 바퀴 더 진행할 수 있어요."
+        return self._spawn(self._stage_talk, 1)
+
+    def start_vote(self):
+        with self.lock:
+            if not (self.s["status"] == "day" or (self.s["status"] == "vote" and self.s.get("step") == "voting")):
+                return "지금은 투표를 시작할 수 없어요."
+        return self._spawn(self._stage_vote)
+
+    def start_night(self):
+        with self.lock:
+            if self.s["status"] not in ("vote", "night") or self.s.get("step") == "voting":
+                return "투표가 끝난 뒤에 밤을 시작할 수 있어요."
+        return self._spawn(self._stage_night)
+
+    def do_action(self, key):
+        return {"round": self.start_round, "vote": self.start_vote, "night": self.start_night,
+                "more": self.more_talk}[key]()
 
     def end_now(self):
         with self.lock:
             if self.running or self.s["status"] in ("lobby", "ended"):
                 return "지금은 종료할 수 없어요."
-        self._end_game("mafia", {}, "진행자가 게임을 종료했어요.")
+        self._end_game("mafia", self._take_pending(), "진행자가 게임을 종료했어요.")
 
     def tally_awards(self):
         with self.lock:
@@ -469,35 +524,42 @@ class Game:
             self._set(error=self.ai.last_error)
         return r
 
-    def _run_round_safe(self):
+    def _safe(self, fn, *args):
         try:
-            self._run_round()
+            fn(*args)
         except Exception as e:  # noqa: BLE001
-            self._set(error=f"진행 중 오류: {type(e).__name__}: {e}", busy="")
+            self._set(error=f"진행 중 오류: {type(e).__name__}: {e}")
         finally:
             with self.lock:
                 self.running = False
-                self.s["busy"] = ""
+                self.s["busy"] = self.s.get("busy") if self.s.get("step", "").startswith("await") else ""
                 self.s["speaking"] = None
                 self.save()
 
-    def _run_round(self):
-        S = self.s["settings"]
-        pts = {}
+    def _add(self, pid, p, why):
+        with self.lock:
+            self.s["pending"].setdefault(pid, []).append({"p": p, "why": why})
 
-        def add(pid, p, why):
-            pts.setdefault(pid, []).append({"p": p, "why": why})
+    def _take_pending(self):
+        with self.lock:
+            pts, self.s["pending"] = self.s.get("pending") or {}, {}
+            return pts
 
+    # ---- 낮
+    def _stage_day_start(self):
         with self.lock:
             for x in alive(self.s):
                 self.s["snap"][x["id"]] = (self.s["prompts"].get(x["id"]) or {}).get("text", "")
-            self.s.update(status="day", round=self.s["round"] + 1, deadline=None, busy="", error="", last_event="")
+            self.s.update(status="day", step="talking", round=self.s["round"] + 1, deadline=None,
+                          busy="", error="", last_event="", pending={})
             self.save()
             n_alive = len(alive(self.s))
         self._log("sys", f'{self.s["round"]}라운드 낮이 밝았어요. 생존자 {n_alive}명.')
+        self._stage_talk(self.s["settings"]["passes"])
 
-        # DAY
-        for _ in range(S["passes"]):
+    def _stage_talk(self, passes):
+        self._set(step="talking")
+        for _ in range(passes):
             order = alive(self.s)
             random.shuffle(order)
             for x in order:
@@ -506,14 +568,17 @@ class Game:
                 text = str((r or {}).get("speech") or "").strip()[:240]
                 if not text:
                     text = "(아무 말도 하지 않았어요)"
-                    add(x["id"], -1, "발언 형식 위반")
+                    self._add(x["id"], -1, "발언 형식 위반")
                 if r and r.get("thought"):
                     with self.lock:
                         self.s["reasons"].append({"round": self.s["round"], "phase": "낮", "seat": x["seat"], "text": str(r["thought"])[:200]})
                 self._log("say", text, seat=x["seat"], name=x["name"])
+        self._set(step="await_vote", speaking=None,
+                  busy="토론이 끝났어요. 진행자가 투표를 시작하면 AI들이 투표해요. 지금 예측 베팅을 하세요.")
 
-        # VOTE
-        self._set(status="vote", busy="AI들이 투표하는 중…", speaking=None)
+    # ---- 투표
+    def _stage_vote(self):
+        self._set(status="vote", step="voting", busy="AI들이 투표하는 중…", speaking=None)
         voters = alive(self.s)
         with ThreadPoolExecutor(max_workers=6) as ex:
             res = list(ex.map(lambda x: self._ask(x["id"], "vote"), voters))
@@ -522,7 +587,7 @@ class Game:
             t = to_int((r or {}).get("vote"))
             target = seat_by_no(self.s, t) if t is not None else None
             if not target or not target["alive"] or target["id"] == x["id"]:
-                add(x["id"], -1, "투표 형식 위반(기권 처리)")
+                self._add(x["id"], -1, "투표 형식 위반(기권 처리)")
                 line.append(f'{x["seat"]}→기권')
                 continue
             tally[t] = tally.get(t, 0) + 1
@@ -547,29 +612,36 @@ class Game:
                     continue
                 t_role, my_role = self.s["roles"][seat_by_no(self.s, v)["id"]], self.s["roles"][x["id"]]
                 if my_role == "citizen":
-                    add(x["id"], 3 if t_role == "mafia" else -2,
-                        f"마피아({v}번)에게 투표" if t_role == "mafia" else f"시민({v}번)에게 투표")
+                    self._add(x["id"], 3 if t_role == "mafia" else -2,
+                              f"마피아({v}번)에게 투표" if t_role == "mafia" else f"시민({v}번)에게 투표")
                 elif v == eliminated["seat"] and t_role == "citizen":
-                    add(x["id"], 3, f"투표한 시민({v}번)이 탈락")
-            ev = f'{label(eliminated)} 탈락 ({tally[eliminated["seat"]]}표). 정체는 {ROLE_KO[role]}였어요.'
+                    self._add(x["id"], 3, f"투표한 시민({v}번)이 탈락")
+            ev = f'{label(eliminated)} 탈락 ({tally[eliminated["seat"]]}표). 정체는 {was(role)}.'
             self._set(last_event=ev)
             self._log("elim", "☀ " + ev)
         else:
             self._set(last_event="유효한 표가 없어 아무도 탈락하지 않았어요.")
             self._log("sys", "유효한 표가 없어 아무도 탈락하지 않았어요.")
 
-        # bets
         with self.lock:
             for pid, b in self.s["bets"].items():
                 if b["round"] == self.s["round"] and eliminated and b["seat"] == eliminated["seat"] and pid in self.s["scores"]:
                     self.s["scores"][pid]["bet"] += 1
             self.save()
-        if self._check_win(pts):
+        if self._check_win():
             return
+        self._set(step="await_night", busy="투표가 끝났어요. 진행자가 밤을 시작하면 마피아가 움직여요.")
 
-        # NIGHT
-        self._set(status="night", busy="마피아가 비밀리에 상의하는 중…")
-        self._log("sys", "밤이 됐어요. 마피아가 움직입니다.")
+    # ---- 밤
+    def _stage_night(self):
+        S = self.s["settings"]
+        self._set(status="night", step="night", busy="마피아가 비밀리에 상의하는 중…")
+        with self.lock:
+            redo = any(c["round"] == self.s["round"] for c in self.s["mafia_chat"])
+            if redo:  # 끊겼던 밤을 다시 하는 경우 이번 라운드 밤 기록을 지운다
+                self.s["mafia_chat"] = [c for c in self.s["mafia_chat"] if c["round"] != self.s["round"]]
+        if not redo:
+            self._log("sys", "밤이 됐어요. 마피아가 움직입니다.")
         mafia_alive = [x for x in alive(self.s) if self.s["roles"][x["id"]] == "mafia"]
         target = None
         for x in mafia_alive:
@@ -580,7 +652,7 @@ class Game:
             t = seat_by_no(self.s, to_int((r or {}).get("target")))
             valid = bool(t and t["alive"] and self.s["roles"][t["id"]] == "citizen")
             if not valid:
-                add(x["id"], -1, "밤 행동 형식 위반")
+                self._add(x["id"], -1, "밤 행동 형식 위반")
             with self.lock:
                 self.s["mafia_chat"].append({"round": self.s["round"], "seat": x["seat"],
                                              "text": str((r or {}).get("message") or "")[:200],
@@ -593,21 +665,21 @@ class Game:
         if target:
             with self.lock:
                 target["alive"], target["revealed"] = False, "citizen"
-            ev = f"밤사이 {label(target)}이(가) 제거됐어요. 정체는 시민이었어요."
+            ev = f"밤사이 {label(target)}이(가) 제거됐어요. 정체는 {was('citizen')}."
             self._set(last_event=ev)
             self._log("elim", "☾ " + ev)
         for x in alive(self.s):
             if self.s["roles"][x["id"]] == "mafia":
-                add(x["id"], 2, "한 라운드 생존")
-        if self._check_win(pts):
+                self._add(x["id"], 2, "한 라운드 생존")
+        if self._check_win():
             return
         if self.s["round"] >= S["max_rounds"]:
-            self._end_game("mafia", pts, f'{S["max_rounds"]}라운드가 끝날 때까지 마피아가 살아남았어요.')
+            self._end_game("mafia", self._take_pending(), f'{S["max_rounds"]}라운드가 끝날 때까지 마피아가 살아남았어요.')
             return
 
-        # STRATEGY
-        self._commit_points(pts)
-        self._set(status="strategy", deadline=time.time() + S["strategy_sec"],
+        # 작전 타임
+        self._commit_points(self._take_pending())
+        self._set(status="strategy", step="reflecting" if S["reflect"] else "", deadline=time.time() + S["strategy_sec"],
                   busy="AI들이 보상을 보고 스스로 전략을 고치는 중…" if S["reflect"] else "")
         self._log("sys", f'작전 타임 {S["strategy_sec"]}초. 학생들은 프롬프트를 고칠 수 있어요.')
         if S["reflect"]:
@@ -618,7 +690,7 @@ class Game:
                         self.s["memos"][x["id"]] = str(r["memo"])[:300]
             with ThreadPoolExecutor(max_workers=6) as ex:
                 list(ex.map(reflect, alive(self.s)))
-        self._set(busy="")
+        self._set(step="", busy="")
 
     def _commit_points(self, pts):
         with self.lock:
@@ -632,14 +704,14 @@ class Game:
                 })
             self.save()
 
-    def _check_win(self, pts):
+    def _check_win(self):
         al = alive(self.s)
         mf = sum(1 for x in al if self.s["roles"][x["id"]] == "mafia")
         if mf == 0:
-            self._end_game("citizen", pts, "마피아가 모두 탈락했어요.")
+            self._end_game("citizen", self._take_pending(), "마피아가 모두 탈락했어요.")
             return True
         if mf >= len(al) - mf:
-            self._end_game("mafia", pts, "마피아 수가 시민 수와 같아졌어요.")
+            self._end_game("mafia", self._take_pending(), "마피아 수가 시민 수와 같아졌어요.")
             return True
         return False
 
@@ -652,7 +724,7 @@ class Game:
             for x in self.s["seats"]:
                 x["revealed"] = self.s["roles"][x["id"]]
             ev = f"{ROLE_KO[winner]} 승리! {why}"
-            self.s.update(status="ended", winner=winner, busy="", speaking=None, deadline=None, last_event=ev)
+            self.s.update(status="ended", step="", winner=winner, busy="", speaking=None, deadline=None, last_event=ev)
             players = []
             for x in self.s["seats"]:
                 pr = self.s["prompts"].get(x["id"]) or {}
